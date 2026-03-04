@@ -1555,6 +1555,131 @@ func TestRemoveOwnerReferencesOnDeleteAppSet(t *testing.T) {
 	}
 }
 
+func TestMarkOrphanedApplications(t *testing.T) {
+	scheme := runtime.NewScheme()
+	err := v1alpha1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	appSet := v1alpha1.ApplicationSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-appset",
+			Namespace: "argocd",
+		},
+		Spec: v1alpha1.ApplicationSetSpec{
+			Template: v1alpha1.ApplicationSetTemplate{
+				Spec: v1alpha1.ApplicationSpec{Project: "default"},
+			},
+		},
+	}
+
+	newApp := func(name string, labels map[string]string, annotations map[string]string) v1alpha1.Application {
+		app := v1alpha1.Application{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        name,
+				Namespace:   "argocd",
+				Labels:      labels,
+				Annotations: annotations,
+			},
+			Spec: v1alpha1.ApplicationSpec{Project: "default"},
+		}
+		err := controllerutil.SetControllerReference(&appSet, &app, scheme)
+		require.NoError(t, err)
+		return app
+	}
+
+	t.Run("marks app as orphaned when no longer in generator output", func(t *testing.T) {
+		existing := newApp("app-removed", nil, nil)
+		kept := newApp("app-kept", nil, nil)
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(&appSet, &existing, &kept).
+			WithIndex(&v1alpha1.Application{}, ".metadata.controller", appControllerIndexer).
+			Build()
+
+		r := ApplicationSetReconciler{
+			Client:   cl,
+			Scheme:   scheme,
+			Recorder: record.NewFakeRecorder(10),
+		}
+
+		// Only "app-kept" is desired; "app-removed" should be orphaned.
+		desired := []v1alpha1.Application{
+			{ObjectMeta: metav1.ObjectMeta{Name: "app-kept", Namespace: "argocd"}},
+		}
+		err := r.markOrphanedApplications(t.Context(), log.NewEntry(log.StandardLogger()), appSet, desired)
+		require.NoError(t, err)
+
+		got := &v1alpha1.Application{}
+		require.NoError(t, cl.Get(t.Context(), crtclient.ObjectKey{Name: "app-removed", Namespace: "argocd"}, got))
+		assert.Equal(t, "true", got.Labels[v1alpha1.LabelKeyApplicationSetOrphaned])
+		assert.Equal(t, "argocd/my-appset", got.Annotations[v1alpha1.AnnotationKeyApplicationSetOrphanedBy])
+
+		// "app-kept" must NOT be orphaned.
+		gotKept := &v1alpha1.Application{}
+		require.NoError(t, cl.Get(t.Context(), crtclient.ObjectKey{Name: "app-kept", Namespace: "argocd"}, gotKept))
+		assert.Empty(t, gotKept.Labels[v1alpha1.LabelKeyApplicationSetOrphaned])
+		assert.Empty(t, gotKept.Annotations[v1alpha1.AnnotationKeyApplicationSetOrphanedBy])
+	})
+
+	t.Run("removes orphaned markers when app returns to generator output", func(t *testing.T) {
+		// "app-returned" was previously orphaned.
+		returned := newApp("app-returned",
+			map[string]string{v1alpha1.LabelKeyApplicationSetOrphaned: "true"},
+			map[string]string{v1alpha1.AnnotationKeyApplicationSetOrphanedBy: "argocd/my-appset"},
+		)
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(&appSet, &returned).
+			WithIndex(&v1alpha1.Application{}, ".metadata.controller", appControllerIndexer).
+			Build()
+
+		r := ApplicationSetReconciler{
+			Client:   cl,
+			Scheme:   scheme,
+			Recorder: record.NewFakeRecorder(10),
+		}
+
+		// "app-returned" is now back in the desired set.
+		desired := []v1alpha1.Application{
+			{ObjectMeta: metav1.ObjectMeta{Name: "app-returned", Namespace: "argocd"}},
+		}
+		err := r.markOrphanedApplications(t.Context(), log.NewEntry(log.StandardLogger()), appSet, desired)
+		require.NoError(t, err)
+
+		got := &v1alpha1.Application{}
+		require.NoError(t, cl.Get(t.Context(), crtclient.ObjectKey{Name: "app-returned", Namespace: "argocd"}, got))
+		assert.Empty(t, got.Labels[v1alpha1.LabelKeyApplicationSetOrphaned])
+		assert.Empty(t, got.Annotations[v1alpha1.AnnotationKeyApplicationSetOrphanedBy])
+	})
+
+	t.Run("marks all apps as orphaned when AppSet is deleted (nil desired)", func(t *testing.T) {
+		app1 := newApp("app-one", nil, nil)
+		app2 := newApp("app-two", nil, nil)
+
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(&appSet, &app1, &app2).
+			WithIndex(&v1alpha1.Application{}, ".metadata.controller", appControllerIndexer).
+			Build()
+
+		r := ApplicationSetReconciler{
+			Client:   cl,
+			Scheme:   scheme,
+			Recorder: record.NewFakeRecorder(10),
+		}
+
+		// nil desired means all apps are orphaned (AppSet deletion case).
+		err := r.markOrphanedApplications(t.Context(), log.NewEntry(log.StandardLogger()), appSet, nil)
+		require.NoError(t, err)
+
+		for _, name := range []string{"app-one", "app-two"} {
+			got := &v1alpha1.Application{}
+			require.NoError(t, cl.Get(t.Context(), crtclient.ObjectKey{Name: name, Namespace: "argocd"}, got))
+			assert.Equal(t, "true", got.Labels[v1alpha1.LabelKeyApplicationSetOrphaned], "expected %s to be orphaned", name)
+			assert.Equal(t, "argocd/my-appset", got.Annotations[v1alpha1.AnnotationKeyApplicationSetOrphanedBy])
+		}
+	})
+}
+
 func TestCreateApplications(t *testing.T) {
 	scheme := runtime.NewScheme()
 	err := v1alpha1.AddToScheme(scheme)
